@@ -1,11 +1,8 @@
 // TIDAL source for BitChord.
-// Metadata: TIDAL's public web catalog API.
-// Playback: a user-configured hifi-api-compatible endpoint, matching the
-// customEndpoint contract used by Mornye's tidal-web extension.
-//
-// This adapter deliberately does not reproduce Mornye's signed Zarz session
-// protocol. Configure TIDAL_HIFI_API_URL with an endpoint you operate and are
-// authorized to use. Only unencrypted direct HTTPS audio URLs are returned.
+// Search uses TIDAL's public catalog API. Playback is delegated to the local
+// Mornye-Python host, which runs the official tidal-web extension and signed
+// Zarz session flow. The completed audio file is then served through a private
+// short-lived URL (download-then-play, not live CDN streaming).
 
 import { NotImplementedError } from "../handler.js";
 
@@ -138,224 +135,58 @@ function normalizeTrackId(value) {
   return /^\d+$/.test(raw) ? raw : "";
 }
 
-function isPrivateIPv4(hostname) {
-  const parts = hostname.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
-  return parts[0] === 10 || parts[0] === 127 ||
-    (parts[0] === 192 && parts[1] === 168) ||
-    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
-    (parts[0] === 169 && parts[1] === 254);
-}
-
-function isLocalHost(hostname) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1" || isPrivateIPv4(host) || host.endsWith(".local");
-}
-
-function getHifiApiBase() {
-  const configured = String(process.env.TIDAL_HIFI_API_URL || "").trim();
-  if (!configured) {
-    throw new NotImplementedError(
-      "TIDAL playback needs TIDAL_HIFI_API_URL: configure your own hifi-api-compatible endpoint"
-    );
-  }
-
-  let url;
-  try {
-    url = new URL(configured);
-  } catch {
-    throw new Error("TIDAL_HIFI_API_URL must be an absolute HTTP(S) URL");
-  }
-  if (url.username || url.password || url.search || url.hash) {
-    throw new Error("TIDAL_HIFI_API_URL must not contain credentials, query parameters, or a fragment");
-  }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalHost(url.hostname))) {
-    throw new Error("TIDAL_HIFI_API_URL must use HTTPS (HTTP is allowed only for a local/private host)");
-  }
-  return url.toString().replace(/\/+$/, "");
-}
-
-function decodeManifestText(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  if (text.startsWith("{") || text.startsWith("<?xml") || text.startsWith("<MPD")) return text;
-  try {
-    return Buffer.from(text, "base64").toString("utf8");
-  } catch {
-    return "";
-  }
-}
-
-function decodeBtsManifest(value) {
-  const decoded = decodeManifestText(value);
-  if (!decoded) return null;
-
-  try {
-    const manifest = JSON.parse(decoded);
-    if (!manifest || typeof manifest !== "object") return null;
-    const encryption = String(manifest.encryptionType || "").toUpperCase();
-    if (encryption !== "NONE") return null;
-    const urls = Array.isArray(manifest.urls) ? manifest.urls : [];
-    const url = urls.find((candidate) => {
-      try { return new URL(candidate).protocol === "https:"; } catch { return false; }
-    });
-    if (!url) return null;
-    return {
-      url,
-      mimeType: String(manifest.mimeType || ""),
-      codecs: String(manifest.codecs || ""),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function isUnencryptedFlacDash(manifestValue) {
-  const xml = decodeManifestText(manifestValue);
-  if (!xml || !/<MPD[\s>]/i.test(xml) || !/<SegmentTemplate[\s>]/i.test(xml)) return false;
-  // Reject DRM/protected representations instead of passing them to BitChord.
-  if (/<ContentProtection\b|cenc:pssh|default_KID|widevine|playready/i.test(xml)) return false;
-  return /codecs=["']flac["']/i.test(xml);
-}
-
-function inferCodec(mimeType, codecs) {
-  const value = `${mimeType} ${codecs}`.toLowerCase();
-  if (value.includes("flac")) return { codec: "flac", container: "flac", format: "flac" };
-  if (value.includes("mpeg") || value.includes("mp3")) return { codec: "mp3", container: "mp3", format: "mp3" };
-  if (value.includes("aac") || value.includes("mp4") || value.includes("mp4a")) {
-    return { codec: "aac", container: "mp4", format: "aac" };
-  }
-  if (value.includes("opus")) return { codec: "opus", container: "ogg", format: "opus" };
-  return null;
-}
-
-async function hifiApiGet(path, params) {
-  const base = getHifiApiBase();
-  const url = new URL(`${base}/${String(path || "").replace(/^\/+/, "")}`);
-  for (const [key, value] of Object.entries(params || {})) {
-    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
-  }
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent": process.env.TIDAL_HIFI_API_USER_AGENT || "BitChord-TIDAL/1.0",
-    },
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`TIDAL hifi-api request failed (HTTP ${response.status})`);
-  return response.json();
-}
-
-function makeQualityLabel(actualQuality, bitDepth, sampleRate) {
-  const base = actualQuality === "HI_RES_LOSSLESS"
-    ? "Hi-Res Lossless"
-    : actualQuality === "LOSSLESS" ? "Lossless" : actualQuality;
-  const details = [];
-  if (bitDepth) details.push(`${bitDepth}-bit`);
-  if (sampleRate) details.push(`${Math.round(sampleRate / 1000 * 10) / 10} kHz`);
-  return details.length ? `${base} (${details.join(", ")})` : base;
-}
-
-function directStreamFromPayload(payload, selectedQuality) {
-  const data = payload?.data;
-  if (!data || String(data.assetPresentation || "FULL").toUpperCase() === "PREVIEW") return null;
-  const decoded = decodeBtsManifest(data.manifest);
-  if (!decoded) return null;
-
-  const audio = inferCodec(decoded.mimeType || data.manifestMimeType, decoded.codecs);
-  if (!audio) return null;
-
-  const bitDepth = Number(data.bitDepth) || undefined;
-  const sampleRate = Number(data.sampleRate) || undefined;
-  const actualQuality = String(data.audioQuality || selectedQuality).toUpperCase();
-  return {
-    url: decoded.url,
-    ...audio,
-    manifest: "none",
-    quality: makeQualityLabel(actualQuality, bitDepth, sampleRate),
-    ...(sampleRate ? { sampleRate } : {}),
-    ...(bitDepth ? { bitDepth } : {}),
-    audioMode: String(data.audioMode || "STEREO"),
-    encrypted: false,
-  };
-}
-
-async function resolveHiResManifest(trackId) {
-  // Mornye's provider uses trackManifests for adaptive Hi-Res/Atmos. For
-  // BitChord, request only FLAC tiers and return the HTTPS MPD URL directly.
-  const payload = await hifiApiGet("trackManifests/", {
-    id: trackId,
-    formats: "FLAC_HIRES,FLAC",
-    adaptive: "true",
-    manifestType: "MPEG_DASH",
-    uriScheme: "HTTPS",
-    usage: "PLAYBACK",
-  });
-  const attributes = payload?.data?.data?.attributes;
-  if (!attributes) return null;
-  const formats = Array.isArray(attributes.formats)
-    ? attributes.formats.map((item) => String(item).toUpperCase())
-    : [];
-  const uri = String(attributes.uri || "").trim();
-  try {
-    if (new URL(uri).protocol !== "https:") return null;
-  } catch {
-    return null;
-  }
-
-  const hasHiRes = formats.includes("FLAC_HIRES") || formats.includes("FLAC_HI_RES");
-  const hasLossless = formats.includes("FLAC");
-  if (!hasHiRes && !hasLossless) return null;
-
-  return {
-    url: uri,
-    format: "flac",
-    codec: "flac",
-    container: "dash",
-    manifest: "dash",
-    quality: hasHiRes ? "Hi-Res Lossless" : "Lossless",
-    audioMode: "STEREO",
-    encrypted: false,
-  };
-}
-
-/** Resolve a TIDAL track through the configured hifi-api-compatible server. */
-export async function resolveStream(trackId, { quality = "HI_RES_LOSSLESS" } = {}) {
+/**
+ * Resolve TIDAL through the local Mornye-Python host.
+ *
+ * The host runs the official tidal-web extension and its Zarz signed-session
+ * implementation. It queues a Mornye download and immediately returns a job
+ * id; BitChord's media URL waits for the completed, unencrypted output file.
+ * This is download-then-play, not direct CDN streaming.
+ */
+export async function resolveStream(trackId, { quality = "LOSSLESS", mediaUrlBuilder } = {}) {
   const id = normalizeTrackId(trackId);
   if (!id) return null;
-
-  const requestedQuality = String(quality || "HI_RES_LOSSLESS").toUpperCase();
-  const selectedQuality = QUALITY_VALUES.has(requestedQuality) ? requestedQuality : "HI_RES_LOSSLESS";
-
-  const payload = await hifiApiGet("track/", { id, quality: selectedQuality });
-  const data = payload?.data;
-  if (!data || String(data.assetPresentation || "FULL").toUpperCase() === "PREVIEW") return null;
-
-  // Standard BTS manifests contain a direct, unencrypted URL. This is the
-  // common path for CD FLAC and the lossy quality tiers.
-  const direct = directStreamFromPayload(payload, selectedQuality);
-  if (direct) return direct;
-
-  // Hi-Res TIDAL streams are commonly returned as a base64 DASH MPD instead
-  // of a BTS URL. Validate the MPD is FLAC and has no DRM declarations, then
-  // request its HTTPS playback URI from the compatible API.
-  if (String(data.manifestMimeType || "").toLowerCase().includes("dash+xml") &&
-      isUnencryptedFlacDash(data.manifest)) {
-    const adaptive = await resolveHiResManifest(id);
-    if (!adaptive) return null;
-    const isHiRes = adaptive.quality === "Hi-Res Lossless";
-    const bitDepth = isHiRes ? (Number(data.bitDepth) || undefined) : undefined;
-    const sampleRate = isHiRes ? (Number(data.sampleRate) || undefined) : undefined;
-    const actualQuality = isHiRes ? "HI_RES_LOSSLESS" : "LOSSLESS";
-    return {
-      ...adaptive,
-      quality: makeQualityLabel(actualQuality, bitDepth, sampleRate),
-      ...(bitDepth ? { bitDepth } : {}),
-      ...(sampleRate ? { sampleRate } : {}),
-      audioMode: String(data.audioMode || "STEREO"),
-    };
+  if (typeof mediaUrlBuilder !== "function") {
+    throw new Error("Private media URL builder is unavailable");
   }
-  return null;
+
+  const bridgeBase = String(process.env.MORNYE_BRIDGE_URL || "http://127.0.0.1:8765").trim().replace(/\/+$/, "");
+  const bridgeToken = String(process.env.INTERNAL_BRIDGE_TOKEN || "").trim();
+  if (!bridgeToken) {
+    throw new NotImplementedError("Mornye playback bridge is not configured");
+  }
+
+  const selectedQuality = QUALITY_VALUES.has(String(quality || "").toUpperCase())
+    ? String(quality).toUpperCase()
+    : "LOSSLESS";
+
+  const response = await fetch(`${bridgeBase}/resolve`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${bridgeToken}`,
+    },
+    body: JSON.stringify({ track_id: id, quality: selectedQuality }),
+    signal: AbortSignal.timeout(12_000),
+  });
+
+  let payload;
+  try { payload = await response.json(); } catch { payload = {}; }
+  if (!response.ok) {
+    const detail = String(payload?.detail || payload?.error || `HTTP ${response.status}`);
+    throw new Error(`Mornye could not queue this TIDAL track: ${detail}`);
+  }
+
+  const jobId = String(payload?.job_id || "");
+  if (!/^[a-f0-9]{32}$/.test(jobId)) {
+    throw new Error("Mornye returned an invalid playback job id");
+  }
+
+  return {
+    url: mediaUrlBuilder(jobId),
+    // BitChord will sniff the completed audio file. We intentionally omit
+    // codec/sample-rate claims until the final file has been produced.
+    encrypted: false,
+  };
 }

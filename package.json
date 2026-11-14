@@ -1,11 +1,14 @@
 {
-  "name": "bitchord-addon",
-  "version": "0.2.0",
+  "name": "bitchord-tidal-mornye",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js"
-  }
+  },
+  "description": "Personal BitChord TIDAL addon backed by Mornye-Python signed sessions"
 }
